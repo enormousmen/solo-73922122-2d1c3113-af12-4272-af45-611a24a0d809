@@ -18,6 +18,14 @@ Business rules (see README for the full spec):
 * Skipped sequence numbers are retained (newest first, last 64) and exposed
   through FastAPI.
 
+Optional delay-broadcast mode (enabled at startup, see ``DELAY_ENABLED``):
+merged packets are not sent immediately. They enter :class:`~app.delay_queue.
+DelayQueue`, receive a monotonic, never-reused queue id independent of the
+wrapping RTP sequence number, and are sent in order once each has aged the
+configured delay (default 8 s). The operator can list pending ids with their
+RTP sequence numbers and retract a closed id interval; a retraction is
+all-or-nothing and retracted packets never reach the playout machine.
+
 The engine is entirely single-threaded: every method runs inside one asyncio
 event loop, so plain containers need no locking.
 """
@@ -28,6 +36,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .delay_queue import DelayQueue, RetractionError
 from .rtp import is_rtp_packet, seq_delta, sequence_number
 
 
@@ -37,11 +46,16 @@ class RelayStats:
     duplicates: int = 0          # packets whose seq was already buffered/sent
     out_of_window: int = 0       # packets beyond the 64-position window
     invalid: int = 0             # non-RTP datagrams
-    forwarded: int = 0
-    skipped: int = 0
+    forwarded: int = 0           # packets handed to the UDP send socket
+    skipped: int = 0             # RTP numbers given up on after the gap wait
     gaps_recovered: int = 0      # gaps closed by a copy from either path
     gaps_timed_out: int = 0      # gaps that ended in a skip
     send_errors: int = 0
+    # Delay-broadcast bookkeeping. Operator retractions are deliberately NOT
+    # counted as ``skipped``: skips are missing upstream packets, retractions
+    # are explicit operator actions on packets that were fully received.
+    retracted: int = 0           # packets pulled by the operator before send
+    retraction_rejections: int = 0  # retraction requests refused wholesale
     path_received: dict = field(default_factory=lambda: {"A": 0, "B": 0})
 
 
@@ -67,6 +81,13 @@ class RelayEngine:
         self._skipped: deque[int] = deque(maxlen=64)
         self.stats = RelayStats()
 
+        # Delay-broadcast mode is opt-in at startup and immutable afterwards.
+        self._delay_enabled = settings.delay_enabled
+        self._delay_queue: Optional[DelayQueue] = None
+        if self._delay_enabled:
+            self._delay_queue = DelayQueue(
+                settings.delay_seconds, self._egress_send, loop=self._loop)
+
     # ------------------------------------------------------------------ API
 
     def handle_packet(self, data: bytes, path: str) -> None:
@@ -78,7 +99,9 @@ class RelayEngine:
         self.stats.received += 1
         self.stats.path_received[path] = self.stats.path_received.get(path, 0) + 1
 
-        # First packet anchors the stream and is forwarded immediately.
+        # First packet anchors the stream. It leaves the merge stage via
+        # _deliver: immediate egress in normal mode, held-and-numbered in
+        # delay mode. Nothing is cached before this anchor.
         if self._next_seq is None:
             self._next_seq = seq
             self._deliver(seq, data)
@@ -104,8 +127,39 @@ class RelayEngine:
     def recent_skipped(self) -> list[int]:
         return list(self._skipped)
 
+    # ------------------------------------------------- delay-broadcast API
+
+    @property
+    def delay_enabled(self) -> bool:
+        return self._delay_enabled
+
+    def pending_packets(self) -> list[dict]:
+        """Queue-id -> RTP-seq view of packets not yet sent/retracted.
+
+        Empty (and cheap) when delay-broadcast mode is disabled.
+        """
+        if self._delay_queue is None:
+            return []
+        return self._delay_queue.pending()
+
+    def retract_range(self, start_id: int, end_id: int) -> dict:
+        """Retract a closed queue-id interval; all-or-nothing semantics.
+
+        Re-raises :class:`ValueError` for malformed intervals and
+        :class:`RetractionError` when any id is not currently pending.
+        """
+        if self._delay_queue is None:
+            raise RuntimeError("delay-broadcast mode is disabled")
+        try:
+            result = self._delay_queue.retract_range(start_id, end_id)
+        except (ValueError, RetractionError):
+            self.stats.retraction_rejections += 1
+            raise
+        self.stats.retracted = self._delay_queue.retracted
+        return result
+
     def status(self) -> dict:
-        return {
+        snap = {
             "next_seq": self._next_seq,
             "buffered": len(self._buffer),
             "gap_wait_active": self._gap_active,
@@ -116,22 +170,51 @@ class RelayEngine:
             "recent_skipped": self.recent_skipped(),
             "stats": self.stats.__dict__.copy(),
         }
+        if self._delay_queue is not None:
+            # RelayStats already mirrors the egress counters via _egress_send;
+            # the delay snapshot adds queue-specific scheduling detail.
+            snap["delay"] = self._delay_queue.snapshot()
+            snap["pending"] = self._delay_queue.pending()
+        else:
+            snap["delay"] = {"enabled": False}
+        return snap
 
     async def aclose(self) -> None:
         self._cancel_timer()
         self._gap_active = False
+        if self._delay_queue is not None:
+            await self._delay_queue.aclose()
 
     # -------------------------------------------------------------- internals
 
-    def _deliver(self, seq: int, data: bytes) -> None:
+    def _egress_send(self, data: bytes) -> None:
+        """Hand a raw datagram to the forward socket; shared egress path.
+
+        This is the single place a packet is handed to UDP, so the
+        ``forwarded``/``send_errors`` counters mean exactly the same thing in
+        immediate and delay modes. The delay queue calls this from its timer.
+        """
         try:
             self._transport.sendto(data, (self._settings.forward_host,
                                           self._settings.forward_port))
-            self.stats.forwarded += 1
         except Exception:  # pragma: no cover - defensive, never kill the loop
             self.stats.send_errors += 1
         finally:
-            self._next_seq = (seq + 1) % self._modulus
+            self.stats.forwarded += 1
+
+    def _deliver(self, seq: int, data: bytes) -> None:
+        """A merged packet leaves the merge stage.
+
+        In delay mode it enters the delay queue (held, queue-id numbered);
+        otherwise it is handed straight to the UDP socket. Either way the
+        RTP pending sequence advances immediately -- merge order is already
+        settled at this point.
+        """
+        if self._delay_queue is not None:
+            self._delay_queue.enqueue(data, seq)
+        else:
+            self._egress_send(data)
+        self._next_seq = (seq + 1) % self._modulus
 
     def _pump(self) -> None:
         """Forward everything available from the pending sequence upward,

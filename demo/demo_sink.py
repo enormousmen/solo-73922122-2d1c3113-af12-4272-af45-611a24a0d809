@@ -7,7 +7,9 @@ reports:
 * gaps (numbers never received),
 * out-of-order arrivals (should never happen for the relay output),
 * the relay's own skip list fetched from its FastAPI ``/skipped`` endpoint,
-  for cross-checking.
+  for cross-checking,
+* in delay-broadcast mode, the relay's retraction counters, so the missing
+  RTP numbers can be attributed to upstream gaps vs. operator retractions.
 """
 from __future__ import annotations
 
@@ -61,6 +63,15 @@ class Sink:
                     report["relay_skipped"] = json.load(resp)["skipped"]
             except Exception as exc:  # demo tool: report, don't crash
                 report["relay_skipped_error"] = repr(exc)
+            try:
+                with urllib.request.urlopen(
+                        self.args.api_url.rstrip("/") + "/status",
+                        timeout=2) as resp:
+                    status = json.load(resp)
+                report["relay_stats"] = status.get("stats", {})
+                report["relay_delay"] = status.get("delay", {"enabled": False})
+            except Exception as exc:  # demo tool: report, don't crash
+                report["relay_status_error"] = repr(exc)
         print(json.dumps(report, indent=2))
         return report
 

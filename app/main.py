@@ -26,6 +26,14 @@ async def serve(settings: Settings) -> None:
                 settings.port_a, settings.port_b)
     logger.info("Forwarding recovered stream to %s:%d (UDP)",
                 settings.forward_host, settings.forward_port)
+    if settings.delay_enabled:
+        logger.info("Delay-broadcast mode ENABLED: merged packets are held "
+                    "for %.3f s before sending; retraction via POST /retract",
+                    settings.delay_seconds)
+    else:
+        logger.info("Delay-broadcast mode disabled (set DELAY_ENABLED=true "
+                    "to hold packets for DELAY_SECONDS=%s s before sending)",
+                    settings.delay_seconds)
 
     app = create_app(engine)
     server = uvicorn.Config(app, host=settings.api_host, port=settings.api_port,

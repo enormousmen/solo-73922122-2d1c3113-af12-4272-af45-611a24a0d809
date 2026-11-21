@@ -21,6 +21,12 @@ services:
       API_PORT: "8000"
       RELAY_WINDOW: "64"
       GAP_TIMEOUT_MS: "80"
+      # Delay-broadcast mode is opt-in at startup. Set DELAY_ENABLED=true to
+      # hold every merged packet for DELAY_SECONDS (default 8) before it can
+      # reach the playout machine; operators retract pending intervals via
+      # GET /pending and POST /retract on the API port.
+      DELAY_ENABLED: "${DELAY_ENABLED:-false}"
+      DELAY_SECONDS: "${DELAY_SECONDS:-8}"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
       interval: 10s

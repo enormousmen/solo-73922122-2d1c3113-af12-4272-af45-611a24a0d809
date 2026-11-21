@@ -19,6 +19,32 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"environment variable {name} must be an integer, got {raw!r}") from exc
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"environment variable {name} must be a number, got {raw!r}") from exc
+
+
+_TRUE_TOKENS = {"1", "true", "yes", "on", "enabled"}
+_FALSE_TOKENS = {"0", "false", "no", "off", "disabled", ""}
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    token = raw.strip().lower()
+    if token in _TRUE_TOKENS:
+        return True
+    if token in _FALSE_TOKENS:
+        return False
+    raise ValueError(f"environment variable {name} must be a boolean, got {raw!r}")
+
+
 @dataclass(frozen=True)
 class Settings:
     # Two ingress UDP ports carrying the same programme.
@@ -34,6 +60,11 @@ class Settings:
     window: int
     # Gap wait budget, milliseconds, starting at the first later packet.
     gap_timeout_ms: int
+    # Delay-broadcast mode, opt-in at startup: every merged packet is held in
+    # a delay queue for delay_seconds before it may reach the playout machine,
+    # giving the operator a window to retract not-yet-sent packets.
+    delay_enabled: bool = False
+    delay_seconds: float = 8.0
     # RTP sequence numbers are 16-bit.
     seq_modulus: int = 1 << 16
 
@@ -48,6 +79,8 @@ class Settings:
             api_port=_env_int("API_PORT", 8000),
             window=_env_int("RELAY_WINDOW", 64),
             gap_timeout_ms=_env_int("GAP_TIMEOUT_MS", 80),
+            delay_enabled=_env_bool("DELAY_ENABLED", False),
+            delay_seconds=_env_float("DELAY_SECONDS", 8.0),
         )
 
     def validate(self) -> None:
@@ -65,3 +98,5 @@ class Settings:
             raise ValueError("RELAY_WINDOW must be in 2..65535")
         if self.gap_timeout_ms <= 0:
             raise ValueError("GAP_TIMEOUT_MS must be positive")
+        if self.delay_seconds <= 0 or self.delay_seconds > 3600:
+            raise ValueError("DELAY_SECONDS must be in (0, 3600]")

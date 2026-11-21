@@ -1,0 +1,89 @@
+# Delay-broadcast end-to-end demo on a single host:
+#   source (two lossy paths) -> relay (8 s hold + operator retraction) -> sink
+#
+#   docker compose -f docker-compose.delay-demo.yml up --build
+#
+# The relay starts with DELAY_ENABLED=true. Every merged packet is held for
+# DELAY_SECONDS (8 s by default) before it may reach the sink. The operator
+# service reads /pending, retracts three contiguous pending packets via
+# POST /retract while they are still inside the hold, then proves the
+# rejection paths and waits for the queue to drain.
+#
+# While it runs:
+#   curl -s localhost:8000/pending
+#   curl -s localhost:8000/status
+#   curl -s -X POST localhost:8000/retract -H 'Content-Type: application/json' \
+#        -d '{"start": 10, "end": 12}'
+services:
+  relay:
+    build: .
+    image: rtp-dual-path-relay:latest
+    container_name: rtp-relay-delay-demo
+    ports:
+      - "8000:8000"
+      - "9100:9100/udp"
+      - "9101:9101/udp"
+    environment:
+      UDP_PORT_A: "9100"
+      UDP_PORT_B: "9101"
+      FORWARD_HOST: "127.0.0.1"
+      FORWARD_PORT: "9200"
+      RELAY_WINDOW: "64"
+      GAP_TIMEOUT_MS: "80"
+      # --- delay-broadcast mode, opt-in at startup ---
+      DELAY_ENABLED: "true"
+      DELAY_SECONDS: "${DELAY_SECONDS:-8}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  sink:
+    image: rtp-dual-path-relay:latest
+    container_name: rtp-sink-delay-demo
+    depends_on:
+      relay:
+        condition: service_healthy
+    network_mode: "service:relay"
+    # Runs long enough to cover the 8 s hold plus the operator's workflow.
+    command: ["python", "-m", "demo.demo_sink", "--host", "127.0.0.1",
+              "--port", "9200", "--duration", "14",
+              "--api-url", "http://127.0.0.1:8000"]
+
+  source:
+    image: rtp-dual-path-relay:latest
+    container_name: rtp-source-delay-demo
+    depends_on:
+      relay:
+        condition: service_healthy
+      sink:
+        condition: service_started
+    network_mode: "service:relay"
+    # Clean, loss-free stream so every sink gap maps 1:1 to an operator
+    # retraction (gap/skip semantics are covered by docker-compose.demo.yml).
+    command: ["python", "-m", "demo.demo_source",
+              "--host", "127.0.0.1",
+              "--port-a", "9100", "--port-b", "9101",
+              "--duration", "2", "--packets-per-sec", "20",
+              "--start-seq", "0"]
+
+  operator:
+    image: rtp-dual-path-relay:latest
+    container_name: rtp-operator-delay-demo
+    depends_on:
+      relay:
+        condition: service_healthy
+      sink:
+        condition: service_started
+      source:
+        condition: service_started
+    network_mode: "service:relay"
+    # Give the source ~1.5 s to populate the hold queue, then retract three
+    # contiguous packets picked from the middle of the live pending queue
+    # (all safely inside the 8 s hold).
+    command: ["python", "-m", "demo.demo_operator",
+              "--api-url", "http://127.0.0.1:8000",
+              "--retract-count", "3",
+              "--wait-packed", "1.5",
+              "--drain-timeout", "12"]
